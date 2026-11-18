@@ -655,7 +655,10 @@ func counterDelta(current, previous uint64) uint64 {
 	if current >= previous {
 		return current - previous
 	}
-	return current
+	// Counter reset (host reboot, interface change, panel state loss):
+	// never re-add the full current total. The traffic after the reset
+	// is counted from the next report onward.
+	return 0
 }
 
 func minUint64(a, b uint64) uint64 {
