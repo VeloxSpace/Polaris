@@ -219,8 +219,17 @@ func TestTrafficAccountingHandlesCounterReset(t *testing.T) {
 		t.Fatal(err)
 	}
 	node, _ = st.Node("traffic-node")
-	if node.TotalUsageBytes != 1150 || node.MonthlyUsageBytes != 1150 {
-		t.Fatalf("counter reset was not handled: total=%d monthly=%d", node.TotalUsageBytes, node.MonthlyUsageBytes)
+	if node.TotalUsageBytes != 1000 || node.MonthlyUsageBytes != 1000 {
+		t.Fatalf("counter reset re-added full total: total=%d monthly=%d", node.TotalUsageBytes, node.MonthlyUsageBytes)
+	}
+	// Counting resumes from the new baseline on the next report.
+	base.RXBytes, base.TXBytes = 200, 150
+	if err := st.Update(base, "Traffic"); err != nil {
+		t.Fatal(err)
+	}
+	node, _ = st.Node("traffic-node")
+	if node.TotalUsageBytes != 1200 || node.MonthlyUsageBytes != 1200 {
+		t.Fatalf("counting did not resume after counter reset: total=%d monthly=%d", node.TotalUsageBytes, node.MonthlyUsageBytes)
 	}
 }
 
