@@ -177,6 +177,7 @@ input:focus, textarea:focus { border-color: var(--green); box-shadow: 0 0 0 3px 
 .resource-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 10px; color: var(--muted); margin-bottom: 7px; }
 .resource-label { display: inline-flex; align-items: center; gap: 7px; }
 .resource-icon { color: var(--green); font-size: 13px; width: 14px; text-align: center; }
+.resource-icon svg { display: block; }
 .resource-value { color: var(--text); font-size: 11px; font-weight: 750; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .resource-track { height: 5px; border-radius: 10px; overflow: hidden; background: var(--line-strong); }
 .resource-fill { display: block; height: 100%; border-radius: inherit; width: 0; transition: width .5s ease; background: var(--green-bright); }
