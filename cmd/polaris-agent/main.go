@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -18,6 +19,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -124,7 +126,7 @@ func sendReport(ctx context.Context, cfg AgentConfig) error {
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(collectCtx, http.MethodPost, cfg.ServerURL+"/api/v1/report", strings.NewReader(string(payload)))
+	req, err := http.NewRequestWithContext(collectCtx, http.MethodPost, cfg.ServerURL+"/api/v1/report", bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
@@ -426,39 +428,49 @@ func parseProbeTargets(raw string) ([]ProbeTarget, error) {
 }
 
 func probeTargets(ctx context.Context, targets []ProbeTarget) []shared.ProbeResult {
-	results := make([]shared.ProbeResult, 0, len(targets))
-	for _, target := range targets {
-		var total time.Duration
-		successes := 0
-		for attempt := 0; attempt < 3; attempt++ {
-			if ctx.Err() != nil {
-				break
-			}
-			started := time.Now()
-			dialer := net.Dialer{Timeout: 400 * time.Millisecond}
-			conn, err := dialer.DialContext(ctx, "tcp", target.Address)
-			if err == nil {
-				total += time.Since(started)
-				successes++
-				_ = conn.Close()
-			}
-			if attempt < 2 {
-				timer := time.NewTimer(50 * time.Millisecond)
-				select {
-				case <-ctx.Done():
-					timer.Stop()
-				case <-timer.C:
-				}
-			}
-		}
-		latency := 0.0
-		if successes > 0 {
-			latency = float64(total.Microseconds()) / 1000 / float64(successes)
-		}
-		loss := float64(3-successes) * 100 / 3
-		results = append(results, shared.ProbeResult{Name: target.Name, Target: target.Address, LatencyMS: latency, LossPercent: loss, Reachable: successes > 0})
+	results := make([]shared.ProbeResult, len(targets))
+	var wg sync.WaitGroup
+	for i, target := range targets {
+		wg.Add(1)
+		go func(i int, target ProbeTarget) {
+			defer wg.Done()
+			results[i] = probeOne(ctx, target)
+		}(i, target)
 	}
+	wg.Wait()
 	return results
+}
+
+func probeOne(ctx context.Context, target ProbeTarget) shared.ProbeResult {
+	var total time.Duration
+	successes := 0
+	for attempt := 0; attempt < 3; attempt++ {
+		if ctx.Err() != nil {
+			break
+		}
+		started := time.Now()
+		dialer := net.Dialer{Timeout: 400 * time.Millisecond}
+		conn, err := dialer.DialContext(ctx, "tcp", target.Address)
+		if err == nil {
+			total += time.Since(started)
+			successes++
+			_ = conn.Close()
+		}
+		if attempt < 2 {
+			timer := time.NewTimer(50 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+			case <-timer.C:
+			}
+		}
+	}
+	latency := 0.0
+	if successes > 0 {
+		latency = float64(total.Microseconds()) / 1000 / float64(successes)
+	}
+	loss := float64(3-successes) * 100 / 3
+	return shared.ProbeResult{Name: target.Name, Target: target.Address, LatencyMS: latency, LossPercent: loss, Reachable: successes > 0}
 }
 
 func discoverLocalPublicAddresses() (string, string) {

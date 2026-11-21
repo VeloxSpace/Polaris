@@ -17,11 +17,13 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/VeloxSpace/polaris/internal/security"
@@ -56,14 +58,15 @@ type Config struct {
 }
 
 type App struct {
-	cfg         Config
-	store       *store.Store
-	limiter     *loginLimiter
-	turnstile   *http.Client
-	sessionsMu  sync.Mutex
-	sessions    map[string]int64
-	notifyMu    sync.Mutex
-	notifyState map[string]time.Time
+	cfg            Config
+	store          *store.Store
+	limiter        *loginLimiter
+	turnstile      *http.Client
+	telegramClient *http.Client
+	sessionsMu     sync.Mutex
+	sessions       map[string]int64
+	notifyMu       sync.Mutex
+	notifyState    map[string]time.Time
 }
 
 type loginLimiter struct {
@@ -236,9 +239,10 @@ func main() {
 	}
 	app := &App{
 		cfg: cfg, store: st,
-		limiter:     &loginLimiter{entries: make(map[string]loginBucket)},
-		turnstile:   &http.Client{Timeout: 5 * time.Second},
-		notifyState: loadNotificationState(filepath.Join(cfg.DataDir, "notification-state.json")),
+		limiter:        &loginLimiter{entries: make(map[string]loginBucket)},
+		turnstile:      &http.Client{Timeout: 5 * time.Second},
+		telegramClient: &http.Client{Timeout: 5 * time.Second},
+		notifyState:    loadNotificationState(filepath.Join(cfg.DataDir, "notification-state.json")),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", app.health)
@@ -257,6 +261,8 @@ func main() {
 	mux.HandleFunc("GET /assets/", app.serveAsset)
 	mux.HandleFunc("GET /", app.index)
 
+	go app.notificationLoop()
+
 	server := &http.Server{
 		Addr: cfg.Listen, Handler: app.securityHeaders(mux),
 		ReadHeaderTimeout: 5 * time.Second,
@@ -265,9 +271,20 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    1 << 16,
 	}
-	log.Printf("Polaris is listening on %s", cfg.Listen)
-	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		fatal("HTTP server stopped")
+	go func() {
+		log.Printf("Polaris is listening on %s", cfg.Listen)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			fatal("HTTP server stopped")
+		}
+	}()
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	<-sig
+	log.Println("shutting down")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Printf("shutdown error: %v", err)
 	}
 }
 
@@ -453,6 +470,17 @@ func (a *App) telegramEnabled() bool {
 	return a.cfg.TelegramBotToken != "" && a.cfg.TelegramChatID != ""
 }
 
+// notificationLoop checks node notifications once a minute in the background
+// so dashboard reads stay fast and do not trigger file writes.
+func (a *App) notificationLoop() {
+	a.checkNotifications(a.store.Nodes())
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		a.checkNotifications(a.store.Nodes())
+	}
+}
+
 func (a *App) checkNotifications(nodes []shared.Report) {
 	a.notifyMu.Lock()
 	defer a.notifyMu.Unlock()
@@ -464,6 +492,7 @@ func (a *App) checkNotifications(nodes []shared.Report) {
 		return
 	}
 	now := time.Now().UTC()
+	changed := false
 	for _, node := range nodes {
 		name := node.Name
 		if name == "" {
@@ -472,9 +501,13 @@ func (a *App) checkNotifications(nodes []shared.Report) {
 		lastSeen := node.LastSeen
 		if !lastSeen.IsZero() && now.Sub(lastSeen) > 5*time.Minute {
 			msg := "[Polaris Alert]\nNode offline\nNode: " + name + " (" + node.NodeID + ")\nLast report: " + lastSeen.Format(time.RFC3339)
-			a.emitChannelAlert(tgOn, node.NodeID+":offline", msg, now)
+			if a.emitChannelAlert(tgOn, node.NodeID+":offline", msg, now) {
+				changed = true
+			}
 		} else {
-			a.emitChannelRecovery(tgOn, node.NodeID+":offline", "[Polaris Alert]\nNode recovered\nNode: "+name+" ("+node.NodeID+").", now)
+			if a.emitChannelRecovery(tgOn, node.NodeID+":offline", "[Polaris Alert]\nNode recovered\nNode: "+name+" ("+node.NodeID+").", now) {
+				changed = true
+			}
 		}
 		mode := node.QuotaMode
 		// Same counted usage as the dashboard monthly card: inbound + outbound,
@@ -491,7 +524,9 @@ func (a *App) checkNotifications(nodes []shared.Report) {
 				if ratio >= float64(threshold) {
 					key := node.NodeID + ":quota:" + node.UsageMonth + ":" + strconv.Itoa(threshold)
 					msg := fmt.Sprintf("[Polaris Alert]\nMonthly quota %d%%\nNode: %s (%s)\nUsage: %s / %s", threshold, name, node.NodeID, formatBytes(monthly), formatBytes(quota))
-					a.emitChannelAlert(tgOn, key, msg, now)
+					if a.emitChannelAlert(tgOn, key, msg, now) {
+						changed = true
+					}
 				}
 			}
 		}
@@ -502,11 +537,16 @@ func (a *App) checkNotifications(nodes []shared.Report) {
 					if days == threshold {
 						key := node.NodeID + ":expiry:" + node.ExpiryDate + ":" + strconv.Itoa(threshold)
 						msg := fmt.Sprintf("[Polaris Alert]\nNode expiry in %d day(s)\nNode: %s (%s)\nDate: %s", threshold, name, node.NodeID, node.ExpiryDate)
-						a.emitChannelAlert(tgOn, key, msg, now)
+						if a.emitChannelAlert(tgOn, key, msg, now) {
+							changed = true
+						}
 					}
 				}
 			}
 		}
+	}
+	if !changed {
+		return
 	}
 	data, err := json.Marshal(a.notifyState)
 	if err == nil {
@@ -515,25 +555,31 @@ func (a *App) checkNotifications(nodes []shared.Report) {
 }
 
 // emitChannelAlert records and sends once per channel via Telegram.
-func (a *App) emitChannelAlert(tgOn bool, baseKey, message string, now time.Time) {
+// It reports whether the notification state changed.
+func (a *App) emitChannelAlert(tgOn bool, baseKey, message string, now time.Time) bool {
 	if tgOn {
 		key := "tg:" + baseKey
 		if _, sent := a.notifyState[key]; !sent {
 			a.sendTelegram(message)
 			a.notifyState[key] = now
+			return true
 		}
 	}
+	return false
 }
 
 // emitChannelRecovery sends a recovery message only on channels that previously recorded offline.
-func (a *App) emitChannelRecovery(tgOn bool, baseKey, message string, now time.Time) {
+// It reports whether the notification state changed.
+func (a *App) emitChannelRecovery(tgOn bool, baseKey, message string, now time.Time) bool {
 	if tgOn {
 		key := "tg:" + baseKey
 		if _, sent := a.notifyState[key]; sent {
 			a.sendTelegram(message)
 			delete(a.notifyState, key)
+			return true
 		}
 	}
+	return false
 }
 
 func (a *App) sendTelegram(message string) {
@@ -549,8 +595,7 @@ func (a *App) sendTelegram(message string) {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := a.telegramClient.Do(req)
 	if err != nil {
 		log.Printf("telegram notification failed category=network")
 		return
@@ -580,7 +625,6 @@ func (a *App) listNodes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	nodes := a.store.Nodes()
-	a.checkNotifications(nodes)
 	writeJSON(w, http.StatusOK, map[string]any{"nodes": nodes})
 }
 
